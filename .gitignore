@@ -1,1 +1,5 @@
 .env
+utils
+*.json
+delete_created_tagged.py
+__pycache__

@@ -2,6 +2,15 @@ import re
 import requests
 
 
+def _parse_iso8601_duration(duration: str) -> int:
+    """Convertit une durée ISO 8601 (ex: PT3M45S) en secondes."""
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", duration)
+    if not m:
+        return 0
+    h, mn, s = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mn * 60 + s
+
+
 class YouTubeService:
     BASE = "https://www.googleapis.com/youtube/v3"
 
@@ -50,18 +59,72 @@ class YouTubeService:
 
     def _fetch_video_details(self, video_ids: list[str]) -> list[dict]:
         r = requests.get(f"{self.BASE}/videos", params={
-            "part": "snippet",
+            "part": "snippet,contentDetails",
             "id": ",".join(video_ids),
             "key": self.api_key,
         })
         r.raise_for_status()
-        return r.json().get("items", [])
+        items = r.json().get("items", [])
+        # Exclure les Shorts (durée < 60 secondes)
+        return [v for v in items if not self._is_short(v)]
+
+    @staticmethod
+    def _is_short(video: dict) -> bool:
+        """Retourne True si la vidéo est un Short (durée < 90s).
+        Si la durée est absente ou 0, on garde la vidéo par défaut."""
+        duration = video.get("contentDetails", {}).get("duration", "")
+        if not duration:
+            return False
+        seconds = _parse_iso8601_duration(duration)
+        return seconds > 0 and seconds < 90
+
+    _STRIP_TAGS = re.compile(r'\[(FREE|free|Free|SOLD|sold|Sold)\]', re.IGNORECASE)
 
     @staticmethod
     def extract_titre_atomique(youtube_title: str) -> str:
-        """Extrait le texte entre les premières guillemets doubles."""
+        """Extrait le texte entre les premières guillemets doubles, sans les tags [FREE]/[SOLD]."""
         m = re.search(r'"([^"]+)"', youtube_title)
-        return m.group(1).strip() if m else ""
+        if not m:
+            return ""
+        titre = YouTubeService._STRIP_TAGS.sub("", m.group(1)).strip()
+        return titre
+
+    @staticmethod
+    def is_sold(youtube_title: str) -> bool:
+        """Retourne True si le titre contient [SOLD] (insensible à la casse)."""
+        return bool(re.search(r'\[sold\]', youtube_title, re.IGNORECASE))
+
+    @staticmethod
+    def format_title(youtube_title: str) -> str:
+        """
+        Reformate le titre YouTube en : "titre_atomique - reste"
+        1. Retire les tags [FREE], [SOLD], etc.
+        2. Extrait le titre_atomique (entre guillemets doubles)
+        3. Retire la partie entre guillemets du titre pour obtenir le "reste"
+        4. Retourne "titre_atomique - reste" (nettoyé)
+        Si pas de guillemets, retourne le titre nettoyé tel quel.
+        """
+        # 1. Retirer les tags
+        cleaned = YouTubeService._STRIP_TAGS.sub("", youtube_title).strip()
+
+        # 2. Extraire le titre_atomique entre guillemets
+        m = re.search(r'"([^"]+)"', cleaned)
+        if not m:
+            return re.sub(r'\s+', ' ', cleaned).strip()
+
+        titre_atomique = m.group(1).strip()
+
+        # 3. Retirer la partie entre guillemets (inclus les guillemets) du titre
+        reste = cleaned[:m.start()] + cleaned[m.end():]
+        # Nettoyer séparateurs résiduels en début/fin (|, -, espace)
+        reste = re.sub(r'^[\s|,\-]+|[\s|,\-]+$', '', reste)
+        reste = re.sub(r'\s+', ' ', reste).strip()
+
+        # 4. Si pas de reste, retourner juste le titre_atomique
+        if not reste:
+            return titre_atomique
+
+        return f'"{titre_atomique}" - {reste}'
 
     @staticmethod
     def parse_description(description: str, title: str = "") -> tuple[int, str, str]:
@@ -70,9 +133,9 @@ class YouTubeService:
 
         # BPM
         tempo = 0
-        m = re.search(r"(\d{2,3})\s*bpm", haystack, re.IGNORECASE)
+        m = re.search(r"bpm\s*[-:]?\s*(\d{2,3})|(\d{2,3})\s*bpm", haystack, re.IGNORECASE)
         if m:
-            tempo = int(m.group(1))
+            tempo = int(m.group(1) or m.group(2))
 
         # Key
         key = "N/A"
